@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Buscador de empresas (ratios_ttm)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; }
+    input, select, button { padding: 8px; font-size: 14px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #e5e5e5; padding: 8px; font-size: 13px; }
+    th { background: #f7f7f7; position: sticky; top: 0; z-index: 1; }
+    td.num, th.num { text-align: right; white-space: nowrap; }
+    .muted { color: #666; font-size: 12px; }
+    .error { color: #b00020; }
+    .nowrap { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <h1>Buscador de empresas</h1>
+  <div class="muted">Cargando automáticamente <code>ratios_ttm.xlsx</code> o <code>ratios_ttm.csv</code> desde esta carpeta.</div>
+
+  <div class="row">
+    <input type="text" id="q" placeholder="Buscar por ticker o nombre…" />
+    <select id="currency"><option value="">Moneda (todas)</option></select>
+    <select id="mktIndex"><option value="">Índice (todos)</option></select>
+    <input type="number" step="0.01" id="peMax" placeholder="PE máx" />
+    <input type="number" step="0.01" id="evEbitdaMax" placeholder="EV/EBITDA máx" />
+    <input type="number" step="0.01" id="pFcfMax" placeholder="P/FCF máx" />
+    <input type="number" step="0.01" id="grossMin" placeholder="Gross margin mín (%)" />
+    <input type="number" step="0.01" id="fcfMin" placeholder="FCF margin mín (%)" />
+    <button id="clear">Limpiar</button>
+  </div>
+
+  <div id="count" class="muted" style="margin-top:6px;">Cargando datos…</div>
+
+  <table id="tbl">
+    <thead>
+    <tr>
+      <th class="nowrap">Ticker</th>
+      <th>Nombre</th>
+      <th>Fecha</th>
+      <th class="num nowrap">Precio</th>
+      <th>Moneda</th>
+      <th class="num nowrap">Market Cap</th>
+      <th class="num nowrap">Enterprise Value</th>
+      <th class="num nowrap">EV/EBITDA</th>
+      <th class="num nowrap">PE</th>
+      <th class="num nowrap">EV/Sales</th>
+      <th class="num nowrap">P/FCF</th>
+      <th class="num nowrap">Gross %</th>
+      <th class="num nowrap">Op. %</th>
+      <th class="num nowrap">Net %</th>
+      <th class="num nowrap">FCF %</th>
+      <th class="num nowrap">ROIC ~</th>
+      <th>Índice</th>
+      <th class="num nowrap">Shares Out.</th>
+      <th class="num nowrap">Deuda</th>
+      <th class="num nowrap">Caja</th>
+      <th class="num nowrap">Net Debt</th>
+      <th class="num nowrap">NetDebt/EBITDA</th>
+    </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- Librerías: XLSX (SheetJS) y PapaParse -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+<script>
+// ---------- Config ----------
+// Pon aquí el nombre de tu archivo. Si existe .xlsx se usará; si no, se intenta .csv.
+const XLSX_PATH = 'ratios_ttm.xlsx';
+const CSV_PATH  = 'ratios_ttm.csv';
+
+// Campos canónicos requeridos (en minúsculas)
+const REQUIRED = [
+  'ticker','as_of_date','price','market_cap','shares_outstanding','currency','cash','total_debt',
+  'enterprise_value','net_debt','ev_ebitda','ev_ebit','pe','ev_sales','p_fcf','gross_margin',
+  'operating_margin','net_margin','fcf_margin','net_debt_ebitda','roic_approx','name','index'
+];
+
+// Aliases habituales de cabecera -> canónico
+const HEADER_ALIASES = {
+  'ev/ebitda':'ev_ebitda','ev / ebitda':'ev_ebitda','ev to ebitda':'ev_ebitda','evtoebitda':'ev_ebitda',
+  'ev/sales':'ev_sales','ev / sales':'ev_sales','ev to sales':'ev_sales','evtosales':'ev_sales',
+  'p/fcf':'p_fcf','p / fcf':'p_fcf','p to fcf':'p_fcf','ptofcf':'p_fcf',
+  'shares out':'shares_outstanding','shares outstanding':'shares_outstanding','sharesoutstanding':'shares_outstanding','shares_outs':'shares_outstanding',
+  'roic':'roic_approx'
+};
+
+const $ = s => document.querySelector(s);
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;' }[m])); }
+function unique(arr){ return [...new Set(arr)].filter(Boolean).sort((a,b)=>a.localeCompare(b)); }
+
+// Normaliza cabecera a canónica
+function canonKey(k){
+  if (!k) return '';
+  let s = String(k).replace(/^\uFEFF/, '').trim().toLowerCase();
+  s = s.normalize('NFKC');
+  s = s.replace(/\s*\/\s*/g,'/').replace(/\s*-\s*/g,'-');
+  if (HEADER_ALIASES[s]) return HEADER_ALIASES[s];
+  s = s.replace(/[^\w]+/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');
+  return HEADER_ALIASES[s] || s;
+}
+
+// Conversión números/porcentajes (soporta "1,484E+10", "1.234.567,89", etc.)
+function toNumber(x){
+  if (x == null || x === '') return null;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : null;
+  let s = String(x).trim();
+
+  // Quita espacios finos y NBSP
+  s = s.replace(/\u00A0/g,' ').replace(/\s+/g,'');
+
+  // Si es notación científica con coma decimal (ej. 1,23E+10) -> cambia coma por punto
+  s = s.replace(/^([+-]?\d+),(\d+)(e[+-]?\d+)$/i, (_,a,b,c)=> `${a}.${b}${c}`);
+
+  // Quita separadores de miles (.) y normaliza coma decimal a punto
+  s = s.replace(/\./g,'').replace(',','.');
+
+  const v = Number(s);
+  return Number.isFinite(v) ? v : null;
+}
+function toPercent(x){
+  if (x == null || x === '') return null;
+  let s = String(x).trim();
+  if (s.endsWith('%')) s = s.slice(0,-1);
+  const n = toNumber(s);
+  if (n == null) return null;
+  return n <= 1 ? n * 100 : n;
+}
+function fmtNum(x){
+  if (x == null) return '';
+  const n = Number(x);
+  if (!Number.isFinite(n)) return '';
+  if (Math.abs(n) >= 1e12) return (n/1e12).toFixed(2) + 'T';
+  if (Math.abs(n) >= 1e9)  return (n/1e9 ).toFixed(2) + 'B';
+  if (Math.abs(n) >= 1e6)  return (n/1e6 ).toFixed(2) + 'M';
+  if (Math.abs(n) >= 1e3)  return (n/1e3 ).toFixed(2) + 'K';
+  return String(n);
+}
+function fmtPct(x){ return x == null ? '' : Number(x).toFixed(1) + '%'; }
+
+// --- Reparador CSV: une líneas hasta que las comillas estén balanceadas ---
+function repairCSVText(text){
+  const out = [];
+  const raw = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let buf = '';
+  for (let i = 0; i < raw.length; i++){
+    let line = buf ? (buf + '\n' + raw[i]) : raw[i];
+    // cuenta comillas no escapadas
+    let cnt = 0;
+    for (let j=0; j<line.length; j++){
+      if (line[j] === '"'){
+        if (line[j+1] === '"'){ j++; continue; }
+        cnt++;
+      }
+    }
+    if (cnt % 2 === 0){ out.push(line); buf = ''; }
+    else { buf = line; }
+  }
+  if (buf) out.push(buf);
+  return out.join('\n');
+}
+
+// --- Estado ---
+let rows = [];
+let filtered = [];
+
+// --- Carga principal ---
+document.addEventListener('DOMContentLoaded', async () => {
+  try {
+    // Primero intentamos XLSX; si no existe, vamos a CSV
+    const tryX = await fetch(XLSX_PATH + '?v=' + Date.now(), { cache:'no-store' });
+    if (tryX.ok){
+      const ab = await tryX.arrayBuffer();
+      await loadFromXLSX(ab);
+    } else {
+      const res = await fetch(CSV_PATH + '?v=' + Date.now(), { cache:'no-store' });
+      if (!res.ok) throw new Error(`No se pudo descargar ${XLSX_PATH} ni ${CSV_PATH}`);
+      const txt = await res.text();
+      await loadFromCSV(txt);
+    }
+
+    populateSelect('#currency', unique(rows.map(r=>r.currency)));
+    populateSelect('#mktIndex', unique(rows.map(r=>r.index)));
+
+    // Eventos
+    $('#q').addEventListener('input', applyFilters);
+    $('#currency').addEventListener('change', applyFilters);
+    $('#mktIndex').addEventListener('change', applyFilters);
+    $('#peMax').addEventListener('input', applyFilters);
+    $('#evEbitdaMax').addEventListener('input', applyFilters);
+    $('#pFcfMax').addEventListener('input', applyFilters);
+    $('#grossMin').addEventListener('input', applyFilters);
+    $('#fcfMin').addEventListener('input', applyFilters);
+    $('#clear').addEventListener('click', () => {
+      $('#q').value = '';
+      $('#currency').value = '';
+      $('#mktIndex').value = '';
+      $('#peMax').value = '';
+      $('#evEbitdaMax').value = '';
+      $('#pFcfMax').value = '';
+      $('#grossMin').value = '';
+      $('#fcfMin').value = '';
+      applyFilters();
+    });
+
+    $('#count').textContent = `Datos cargados (${rows.length} filas)`;
+    applyFilters();
+  } catch (e) {
+    console.error(e);
+    $('#count').innerHTML = '<span class="error">Error: ' + escapeHtml(e.message) + '</span>';
+  }
+});
+
+// --- Lectura XLSX ---
+async function loadFromXLSX(arrayBuffer){
+  const wb = XLSX.read(arrayBuffer, { type:'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const json = XLSX.utils.sheet_to_json(ws, { defval:'', raw:false }); // raw:false -> textos legibles (maneja 1,234E+10)
+
+  // Normaliza keys
+  const norm = json.map(row => {
+    const o = {};
+    Object.keys(row).forEach(k => { o[canonKey(k)] = row[k]; });
+    return o;
+  });
+
+  validateRequired(norm);
+
+  rows = norm.map(r => ({
+    ticker: r.ticker || '',
+    name: r.name || '',
+    as_of_date: normalizeDate(r.as_of_date),
+    price: toNumber(r.price),
+    market_cap: toNumber(r.market_cap),
+    shares_outstanding: toNumber(r.shares_outstanding),
+    currency: r.currency || '',
+    cash: toNumber(r.cash),
+    total_debt: toNumber(r.total_debt),
+    enterprise_value: toNumber(r.enterprise_value),
+    net_debt: toNumber(r.net_debt),
+    ev_ebitda: toNumber(r.ev_ebitda),
+    ev_ebit: toNumber(r.ev_ebit),
+    pe: toNumber(r.pe),
+    ev_sales: toNumber(r.ev_sales),
+    p_fcf: toNumber(r.p_fcf),
+    gross_margin: toPercent(r.gross_margin),
+    operating_margin: toPercent(r.operating_margin),
+    net_margin: toPercent(r.net_margin),
+    fcf_margin: toPercent(r.fcf_margin),
+    net_debt_ebitda: toNumber(r.net_debt_ebitda),
+    roic_approx: toPercent(r.roic_approx),
+    index: r.index || ''
+  })).filter(x => x.ticker || x.name);
+}
+
+// --- Lectura CSV ---
+async function loadFromCSV(text){
+  const fixed = repairCSVText(text);
+  const parsed = Papa.parse(fixed, {
+    header: true,
+    dynamicTyping: false,
+    skipEmptyLines: 'greedy',
+    delimitersToGuess: [',',';','\t','|']
+  });
+  if (parsed.errors && parsed.errors.length){
+    console.warn('PapaParse errors (primeros 3):', parsed.errors.slice(0,3));
+  }
+  const norm = parsed.data.map(rec => {
+    const o = {};
+    for (const k in rec) o[canonKey(k)] = rec[k];
+    return o;
+  });
+
+  validateRequired(norm);
+
+  rows = norm.map(r => ({
+    ticker: r.ticker || '',
+    name: r.name || '',
+    as_of_date: normalizeDate(r.as_of_date),
+    price: toNumber(r.price),
+    market_cap: toNumber(r.market_cap),
+    shares_outstanding: toNumber(r.shares_outstanding),
+    currency: r.currency || '',
+    cash: toNumber(r.cash),
+    total_debt: toNumber(r.total_debt),
+    enterprise_value: toNumber(r.enterprise_value),
+    net_debt: toNumber(r.net_debt),
+    ev_ebitda: toNumber(r.ev_ebitda),
+    ev_ebit: toNumber(r.ev_ebit),
+    pe: toNumber(r.pe),
+    ev_sales: toNumber(r.ev_sales),
+    p_fcf: toNumber(r.p_fcf),
+    gross_margin: toPercent(r.gross_margin),
+    operating_margin: toPercent(r.operating_margin),
+    net_margin: toPercent(r.net_margin),
+    fcf_margin: toPercent(r.fcf_margin),
+    net_debt_ebitda: toNumber(r.net_debt_ebitda),
+    roic_approx: toPercent(r.roic_approx),
+    index: r.index || ''
+  })).filter(x => x.ticker || x.name);
+}
+
+// --- Validación de cabeceras ---
+function validateRequired(norm){
+  const present = new Set(Object.keys(norm[0] || {}));
+  const missing = REQUIRED.filter(k => !present.has(k));
+  if (missing.length){
+    throw new Error('Faltan columnas: ' + missing.join(', ') +
+      '\nCabeceras detectadas: ' + Array.from(present).join(', '));
+  }
+}
+
+// --- Normaliza fechas "28/09/2025" -> "2025-09-28" (si viene como texto) ---
+function normalizeDate(x){
+  if (!x) return '';
+  if (typeof x === 'number') return String(x); // por si llega como serial Excel ya convertido a texto
+  const s = String(x).trim();
+  // dd/mm/yyyy o dd-mm-yyyy
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (m){
+    const d = m[1].padStart(2,'0'), mo = m[2].padStart(2,'0');
+    const y = m[3].length === 2 ? ('20'+m[3]) : m[3];
+    return `${y}-${mo}-${d}`;
+  }
+  return s;
+}
+
+function populateSelect(sel, values){
+  const el = $(sel);
+  const first = el.querySelector('option')?.outerHTML || '';
+  el.innerHTML = first + values.map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+}
+
+// --- Filtros + render ---
+function applyFilters(){
+  const q = $('#q').value.trim().toLowerCase();
+  const currency = $('#currency').value;
+  const mktIndex = $('#mktIndex').value;
+  const peMax = $('#peMax').value ? Number($('#peMax').value) : null;
+  const evEbitdaMax = $('#evEbitdaMax').value ? Number($('#evEbitdaMax').value) : null;
+  const pFcfMax = $('#pFcfMax').value ? Number($('#pFcfMax').value) : null;
+  const grossMin = $('#grossMin').value ? Number($('#grossMin').value) : null;
+  const fcfMin = $('#fcfMin').value ? Number($('#fcfMin').value) : null;
+
+  filtered = rows.filter(r => {
+    const matchesQ = !q || r.ticker.toLowerCase().includes(q) || r.name.toLowerCase().includes(q);
+    const matchesCurrency = !currency || r.currency === currency;
+    const matchesIndex = !mktIndex || r.index === mktIndex;
+    const okPE = peMax == null || (r.pe != null && r.pe <= peMax);
+    const okEVEbitda = evEbitdaMax == null || (r.ev_ebitda != null && r.ev_ebitda <= evEbitdaMax);
+    const okPFcf = pFcfMax == null || (r.p_fcf != null && r.p_fcf <= pFcfMax);
+    const okGross = grossMin == null || (r.gross_margin != null && r.gross_margin >= grossMin);
+    const okFcf = fcfMin == null || (r.fcf_margin != null && r.fcf_margin >= fcfMin);
+    return matchesQ && matchesCurrency && matchesIndex && okPE && okEVEbitda && okPFcf && okGross && okFcf;
+  });
+
+  $('#count').textContent = `${filtered.length} resultados`;
+  renderTable(filtered.slice(0, 500));
+}
+
+function renderTable(data){
+  const tbody = document.querySelector('#tbl tbody');
+  tbody.innerHTML = data.map(r => `
+    <tr>
+      <td class="nowrap">${escapeHtml(r.ticker)}</td>
+      <td>${escapeHtml(r.name)}</td>
+      <td class="nowrap">${escapeHtml(r.as_of_date)}</td>
+      <td class="num">${r.price ?? ''}</td>
+      <td>${escapeHtml(r.currency)}</td>
+      <td class="num">${fmtNum(r.market_cap)}</td>
+      <td class="num">${fmtNum(r.enterprise_value)}</td>
+      <td class="num">${r.ev_ebitda ?? ''}</td>
+      <td class="num">${r.pe ?? ''}</td>
+      <td class="num">${r.ev_sales ?? ''}</td>
+      <td class="num">${r.p_fcf ?? ''}</td>
+      <td class="num">${fmtPct(r.gross_margin)}</td>
+      <td class="num">${fmtPct(r.operating_margin)}</td>
+      <td class="num">${fmtPct(r.net_margin)}</td>
+      <td class="num">${fmtPct(r.fcf_margin)}</td>
+      <td class="num">${fmtPct(r.roic_approx)}</td>
+      <td>${escapeHtml(r.index)}</td>
+      <td class="num">${fmtNum(r.shares_outstanding)}</td>
+      <td class="num">${fmtNum(r.total_debt)}</td>
+      <td class="num">${fmtNum(r.cash)}</td>
+      <td class="num">${fmtNum(r.net_debt)}</td>
+      <td class="num">${r.net_debt_ebitda ?? ''}</td>
+    </tr>
+  `).join('');
+}
+</script>
+</body>
+</html>
